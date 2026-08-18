@@ -1,4 +1,5 @@
 #type: ignore
+import asyncio
 import json
 import os
 from typing import Dict, Set, Tuple
@@ -24,7 +25,9 @@ ROOT_MANIFEST = "manifest/manifest_assetmanifest"
 class assetmgr:
     def __init__(self):
         self.ver = None
+        self._loaded_ver = None
         self.registries: AssetRegistry = {}
+        self._manifest_lock = asyncio.Lock()
 
     res = 'https://l1-prod-patch-gzlj.bilibiligame.net/client_ob_771'
 
@@ -186,7 +189,7 @@ class assetmgr:
             raise ValueError(f'remote manifest {ver} contains no assets')
         return registry
 
-    async def init(self, ver):
+    async def _load_registry(self, ver: int) -> AssetRegistry:
         os.makedirs(self._manifest_dir(), exist_ok=True)
         compact_path = self._compact_cache_path(ver)
         legacy_path = self._legacy_cache_path(ver)
@@ -213,15 +216,51 @@ class assetmgr:
                 registry = await self._fetch_registry(ver)
                 logger.info(f'manifest version {ver} loaded from remote')
 
-            self._write_compact_cache(compact_path, ver, registry)
+            # registry 已在内存可用，缓存写失败（如磁盘满）不应阻断本次加载
+            try:
+                self._write_compact_cache(compact_path, ver, registry)
+            except OSError as e:
+                logger.warning(f'failed to write compact manifest version {ver}: {e}')
 
-        self.registries = registry
+        return registry
+
+    def set_version(self, ver: int):
         self.ver = ver
+
+    async def _ensure_loaded_locked(self, ver: int):
+        if self._loaded_ver == ver:
+            return
+
+        registry = await self._load_registry(ver)
+        self.registries = registry
+        self._loaded_ver = ver
+
+    async def ensure_loaded(self, ver=None):
+        # 在锁内取版本号，避免等锁期间版本切换导致按旧版本多做一次重载
+        async with self._manifest_lock:
+            target_ver = self.ver if ver is None else ver
+            if target_ver is None:
+                raise RuntimeError('asset manifest version is not set')
+
+            await self._ensure_loaded_locked(target_ver)
+
+    async def init(self, ver):
+        self.set_version(ver)
+        await self.ensure_loaded(ver)
+
+    async def _resolve_asset(self, url: str) -> AssetEntry:
+        async with self._manifest_lock:
+            target_ver = self.ver
+            if target_ver is None:
+                raise RuntimeError('asset manifest version is not set')
+
+            await self._ensure_loaded_locked(target_ver)
+            return self.registries[url]
 
     async def download(self, url: str) -> bytes:
         logger.info(f"resolving {url}...")
 
-        md5, category = self.registries[url]
+        md5, category = await self._resolve_asset(url)
         download_url = f'{self.pool}/{category}/{md5[:2]}/{md5}'
         return await (await aiorequests.get(download_url)).content
 
